@@ -1,14 +1,4 @@
-API_KEY = "tu-clave-de-gemini"
-SHEET_ID = "el-id-de-tu-hoja-de-google"
-
-[gcp_service_account]
-type = "service_account"
-project_id = "tu-proyecto"
-private_key_id = "..."
-private_key = "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
-client_email = "algo@tu-proyecto.iam.gserviceaccount.com"
-client_id = "..."
-auth_uri = "https://accounts.google.com/o/oauth2/auth"
-token_uri = "https://oauth2.googleapis.com/token"
-auth_provider_x509_cert_url = "https://www.googleapis.com/oauth2/v1/certs"
-client_x509_cert_url = "..."
+.streamlit/secrets.toml
+progress.json
+__pycache__/
+*.pyc
