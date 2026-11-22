@@ -1,109 +1,143 @@
-key = (level, skill)
-version = st.session_state.versions.get(key, 0)
+import json
+import re
+from datetime import datetime
 
-if generate:
-    if not api_key:
-        st.error("Introduce tu clave API en la barra lateral "
-                 "(Gemini y Groq la dan gratis).")
+import pandas as pd
+import requests
+import streamlit as st
+import streamlit.components.v1 as components
+
+from gsheets_sync import clear_progress, load_progress, save_result as sync_save
+
+st.set_page_config(page_title="British English · MCER A1–C2", page_icon="🇬🇧", layout="centered")
+
+# ------------------------------------------------------------------ #
+# Configuración                                                       #
+# ------------------------------------------------------------------ #
+LEVELS = ["A1", "A2", "B1", "B2", "C1", "C2"]
+LEVEL_NAMES = {
+    "A1": "Principiante", "A2": "Elemental", "B1": "Intermedio",
+    "B2": "Intermedio alto", "C1": "Avanzado", "C2": "Maestría",
+}
+CEFR_DESC = {
+    "A1": "Entiende y usa expresiones cotidianas básicas; se presenta y responde preguntas simples.",
+    "A2": "Se comunica en tareas simples y rutinarias; describe su entorno y necesidades inmediatas.",
+    "B1": "Se desenvuelve en viajes, describe experiencias y da opiniones sencillas.",
+    "B2": "Interactúa con fluidez y espontaneidad; argumenta ventajas e inconvenientes.",
+    "C1": "Uso flexible y eficaz del idioma con fines sociales, académicos y profesionales.",
+    "C2": "Comprende prácticamente todo con facilidad y se expresa con precisión y matices.",
+}
+BRIT_TIPS = {
+    "A1": "flat = piso · autumn = otoño · biscuit = galleta",
+    "A2": "lift = ascensor · holiday = vacaciones · chemist's = farmacia · queue = fila",
+    "B1": "lorry = camión · postcode = código postal · rubbish = basura · petrol = gasolina",
+    "B2": "'have got' es muy británico: *I've got a car* · at the weekend (no 'on')",
+    "C1": "Registro: *shall we?*, *fancy a cuppa?*, *brilliant*, *cheers* = gracias (informal)",
+    "C2": "Matices: *quite good* en británico puede significar 'regular', no 'muy bueno'.",
+}
+SKILLS = [
+    ("vocab", "📝 Vocabulario"),
+    ("grammar", "✏️ Gramática"),
+    ("reading", "📖 Lectura"),
+    ("listening", "🎧 Escucha"),
+    ("writing", "🖊️ Escritura"),
+]
+SKILL_LABEL = dict(SKILLS)
+PROVIDERS = {
+    "Gemini (gratis)": {
+        "kind": "gemini",
+        "model": "gemini-2.5-flash",  # ← modelo actualizado
+        "help": "Clave gratuita en https://aistudio.google.com/app/apikey",
+    },
+    "Groq (gratis)": {
+        "kind": "openai",
+        "base": "https://api.groq.com/openai/v1",
+        "model": "llama-3.3-70b-versatile",
+        "help": "Clave gratuita en https://console.groq.com/keys",
+    },
+    "OpenAI": {
+        "kind": "openai",
+        "base": "https://api.openai.com/v1",
+        "model": "gpt-4o-mini",
+        "help": "Clave de pago en https://platform.openai.com/api-keys",
+    },
+}
+
+# ------------------------------------------------------------------ #
+# Progreso persistente (Google Sheets si hay credenciales; si no,    #
+# fichero local progress.json)                                        #
+# ------------------------------------------------------------------ #
+def save_result(level, skill, score, total):
+    entry = {
+        "date": datetime.now().isoformat(timespec="seconds"),
+        "level": level,
+        "skill": skill,
+        "score": score,
+        "total": total,
+        "percent": round(100 * score / total, 1),
+    }
+    st.session_state.history.append(entry)
+    if sync_save(entry):
+        st.toast("☁️ Sincronizado con Google Sheets")
+
+
+def grade(pct):
+    if pct >= 90:
+        return "A — Sobresaliente 🏆"
+    if pct >= 75:
+        return "B — Notable 💪"
+    if pct >= 60:
+        return "C — Aprobado ✅"
+    return "D — A repasar 📚"
+
+
+def next_level_advice(df):
+    for i, lv in enumerate(LEVELS[:-1]):
+        sub = df[df["level"] == lv].tail(3)
+        if len(sub) >= 3 and sub["percent"].mean() >= 85:
+            nxt = LEVELS[i + 1]
+            return (f"Media de {sub['percent'].mean():.0f} % en tus últimos 3 intentos "
+                    f"de **{lv}** → listo para subir a **{nxt}** 🎯")
+    if (df["level"] == "C2").any() and df[df["level"] == "C2"]["percent"].mean() >= 85:
+        return "Dominas C2: nivel de maestría. ¡Enhorabuena! 🏆"
+    return "Sigue practicando: con una media del 85 % en tus últimos 3 intentos de un nivel, te recomendaré subir."
+
+# ------------------------------------------------------------------ #
+# Llamadas a la API                                                   #
+# ------------------------------------------------------------------ #
+def call_llm(prompt, provider, model, api_key):
+    cfg = PROVIDERS[provider]
+    if cfg["kind"] == "gemini":
+        url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
+               f"{model}:generateContent?key={api_key}")
+        body = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"temperature": 0.8,
+                                 "responseMimeType": "application/json"},
+        }
+        r = requests.post(url, json=body, timeout=90)
     else:
-        with st.spinner("Generando ejercicios con IA…"):
-            try:
-                raw = call_llm(build_prompt(level, skill, topic),
-                               provider, model, api_key)
-                st.session_state.bank[key] = parse_json(raw)
-                st.session_state.versions[key] = version + 1
-                st.rerun()
-            except Exception as e:
-                st.error(f"No se pudo generar: {e}")
+        url = f"{cfg['base']}/chat/completions"
+        body = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": "Eres un generador de ejercicios. "
+                                              "Respondes únicamente con JSON válido."},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.8,
+            "response_format": {"type": "json_object"},
+        }
+        r = requests.post(url, headers={"Authorization": f"Bearer {api_key}"},
+                          json=body, timeout=90)
+    if r.status_code != 200:
+        raise RuntimeError(f"La API respondió {r.status_code}: {r.text[:400]}")
+    data = r.json()
+    if cfg["kind"] == "gemini":
+        return data["candidates"][0]["content"]["parts"][0]["text"]
+    return data["choices"][0]["message"]["content"]
 
-data = st.session_state.bank.get(key)
-if not data:
-    st.info("Pulsa **✨ Generar ejercicios** para empezar. "
-            "Cada pulsación crea un set nuevo, así que nunca repetirás.")
-else:
-    prefix = f"{level}_{skill}_{st.session_state.versions.get(key, 0)}"
 
-    def render_quiz(questions):
-        with st.form(f"form_{prefix}"):
-            chosen = []
-            for i, item in enumerate(questions):
-                st.markdown(f"**{i + 1}. {item['q']}**")
-                chosen.append(st.radio("Elige:", item["options"],
-                                       key=f"{prefix}_q{i}",
-                                       label_visibility="collapsed"))
-            submitted = st.form_submit_button("Corregir ✅", type="primary")
-        if submitted:
-            score = 0
-            for i, item in enumerate(questions):
-                ok = item["options"].index(chosen[i]) == item["answer"]
-                score += ok
-                if ok:
-                    st.success(f"{i + 1}. ✅ Correcto — {item['explain']}")
-                else:
-                    st.error(f"{i + 1}. ❌ Correcta: **{item['options'][item['answer']]}**"
-                             f" — {item['explain']}")
-            total = len(questions)
-            pct = round(100 * score / total)
-            save_result(level, skill, score, total)
-            c1, c2 = st.columns(2)
-            c1.metric("Resultado", f"{score}/{total} · {pct} %")
-            c2.metric("Calificación", grade(pct))
-            if pct == 100:
-                st.balloons()
-            st.caption("Guardado en tu historial · Genera un set nuevo para seguir practicando.")
-
-    if skill in ("vocab", "grammar"):
-        render_quiz(data["questions"])
-
-    elif skill == "reading":
-        st.markdown("### 📖 Lee el texto")
-        st.write(data["text"])
-        st.divider()
-        render_quiz(data["questions"])
-
-    elif skill == "listening":
-        st.markdown("### 🎧 Escucha con atención")
-        st.caption("Usa la voz británica (en-GB) de tu navegador. "
-                   "Puedes repetirla las veces que quieras.")
-        if st.button("🔊 Escuchar / repetir"):
-            speak(data["transcript"])
-        with st.expander("Ver transcripción (solo si te rindes 😄)"):
-            st.write(data["transcript"])
-        st.divider()
-        render_quiz(data["questions"])
-
-    elif skill == "writing":
-        st.markdown("### 🖊️ Tarea de escritura")
-        st.write(data["prompt"])
-        text = st.text_area("Escribe aquí tu texto en inglés:", height=180,
-                            key=f"{prefix}_essay")
-        with st.expander("Ver ejemplo de respuesta y criterios"):
-            st.write(data["model"])
-            for c in data["checklist"]:
-                st.write(f"- {c}")
-        if st.button("🤖 Corregir con IA", type="primary"):
-            if not api_key:
-                st.error("Introduce tu clave API en la barra lateral.")
-            elif len(text.strip()) < 10:
-                st.warning("Escribe un poco más antes de corregir.")
-            else:
-                with st.spinner("Corrigiendo…"):
-                    try:
-                        raw = call_llm(build_correction_prompt(level, data["prompt"], text),
-                                       provider, model, api_key)
-                        fb = parse_json(raw)
-                    except Exception as e:
-                        st.error(f"No se pudo corregir: {e}")
-                        st.stop()
-                score = int(fb.get("score", 0))
-                save_result(level, skill, score, 100)
-                c1, c2, c3 = st.columns(3)
-                c1.metric("Puntuación", f"{score}/100")
-                c2.metric("Calificación", grade(score))
-                c3.metric("Nivel estimado", fb.get("level_estimate", "—"))
-                for corr in fb.get("corrections", []):
-                    st.error(f"❌ {corr['original']} → ✅ **{corr['corrected']}**"
-                             f" — {corr['why']}")
-                st.success(f"✨ Versión mejorada: {fb.get('improved', '')}")
-                st.info(f"💬 {fb.get('comments', '')}")
-                st.caption("Guardado en tu historial.")
+def parse_json(text):
+    t = text.strip()
+    t = re.sub(r"^
